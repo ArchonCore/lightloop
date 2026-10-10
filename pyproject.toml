@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lightloop"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small model-and-tools loop that runs in your own process."
 readme = "README.md"
 license = "Apache-2.0"

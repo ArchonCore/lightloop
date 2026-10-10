@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -47,6 +47,35 @@ class _Messages:
     def create(self, **kwargs: Any) -> Answer:
         return self.owner._create(**kwargs)
 
+    def stream_create(self, *, on_text: Callable[[str], None], **kwargs: Any) -> Answer:
+        """The same answer, its text handed to `on_text` piece by piece as it is written."""
+        return self.owner._stream(on_text, **kwargs)
+
+
+def _sse(lines) -> Any:
+    """Server-sent events as `(event, data)` pairs, `data` parsed from JSON."""
+    event, data = "", []
+    for line in lines:
+        if line == "":
+            if data:
+                raw = "\n".join(data)
+                if raw != "[DONE]":
+                    try:
+                        yield event, json.loads(raw)
+                    except ValueError:
+                        pass
+            event, data = "", []
+            continue
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data.append(line[5:].lstrip())
+    if data and "\n".join(data) != "[DONE]":
+        try:
+            yield event, json.loads("\n".join(data))
+        except ValueError:
+            pass
+
 
 class AnthropicClient:
     def __init__(self, base_url: str, token: str, *, bearer: bool = True,
@@ -76,6 +105,56 @@ class AnthropicClient:
         return Answer(blocks, dict(data.get("usage") or {}), str(data.get("model") or ""),
                       str(data.get("stop_reason") or ""))
 
+    def _stream(self, on_text: Callable[[str], None], **kwargs: Any) -> Answer:
+        blocks: dict[int, dict] = {}
+        usage: dict = {}
+        model, stop = "", ""
+        with httpx.stream("POST", self.url, json={**kwargs, "stream": True},
+                          headers=self.headers, timeout=self.timeout) as answer:
+            if answer.status_code >= 400:
+                answer.read()
+                raise ModelError(answer.status_code, answer.text)
+            for event, data in _sse(answer.iter_lines()):
+                kind = data.get("type") or event
+                if kind == "message_start":
+                    message = data.get("message") or {}
+                    model = str(message.get("model") or "")
+                    usage.update(message.get("usage") or {})
+                elif kind == "content_block_start":
+                    block = dict(data.get("content_block") or {})
+                    block["_json"] = ""
+                    blocks[int(data.get("index", len(blocks)))] = block
+                elif kind == "content_block_delta":
+                    block = blocks.setdefault(int(data.get("index", 0)), {"type": "text"})
+                    delta = data.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text = str(delta.get("text") or "")
+                        block["text"] = block.get("text", "") + text
+                        if text:
+                            on_text(text)
+                    elif delta.get("type") == "input_json_delta":
+                        block["_json"] = block.get("_json", "") + str(delta.get("partial_json")
+                                                                      or "")
+                elif kind == "message_delta":
+                    usage.update(data.get("usage") or {})
+                    stop = str((data.get("delta") or {}).get("stop_reason") or stop)
+                elif kind == "error":
+                    raise ModelError(500, json.dumps(data))
+        out = []
+        for index in sorted(blocks):
+            b = blocks[index]
+            if b.get("type") == "tool_use":
+                try:
+                    args = json.loads(b.get("_json") or "{}") if b.get("_json") \
+                        else dict(b.get("input") or {})
+                except ValueError:
+                    args = {}
+                out.append(Block("tool_use", id=b.get("id", ""), name=b.get("name", ""),
+                                 input=args))
+            elif b.get("type") == "text":
+                out.append(Block("text", text=b.get("text", "")))
+        return Answer(out, usage, model, stop)
+
 
 class OpenAIClient:
     """Chat completions, answered in the Anthropic shape."""
@@ -88,9 +167,9 @@ class OpenAIClient:
         self.timeout = timeout
         self.messages = _Messages(self)
 
-    def _create(self, *, model: str, max_tokens: int, messages: list, system: Any = None,
-                tools: Optional[list] = None, tool_choice: Optional[dict] = None,
-                **extra: Any) -> Answer:
+    @staticmethod
+    def _body(model: str, max_tokens: int, messages: list, system: Any,
+              tools: Optional[list], tool_choice: Optional[dict], extra: dict) -> dict:
         body: dict = {"model": model, "max_completion_tokens": max_tokens,
                       "messages": _openai_messages(system, messages), **extra}
         if tools:
@@ -99,6 +178,51 @@ class OpenAIClient:
                 "parameters": t.get("input_schema") or {"type": "object"}}} for t in tools]
             choice = (tool_choice or {}).get("type", "auto")
             body["tool_choice"] = "required" if choice == "any" else "auto"
+        return body
+
+    def _stream(self, on_text: Callable[[str], None], *, model: str, max_tokens: int,
+                messages: list, system: Any = None, tools: Optional[list] = None,
+                tool_choice: Optional[dict] = None, **extra: Any) -> Answer:
+        body = self._body(model, max_tokens, messages, system, tools, tool_choice, extra)
+        body.update(stream=True, stream_options={"include_usage": True})
+        text, calls, usage, named = "", {}, {}, model
+        with httpx.stream("POST", self.url, json=body, headers=self.headers,
+                          timeout=self.timeout) as answer:
+            if answer.status_code >= 400:
+                answer.read()
+                raise ModelError(answer.status_code, answer.text)
+            for _event, data in _sse(answer.iter_lines()):
+                named = str(data.get("model") or named)
+                if data.get("usage"):
+                    usage = data["usage"]
+                for choice in data.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        text += piece
+                        on_text(piece)
+                    for call in delta.get("tool_calls") or []:
+                        held = calls.setdefault(int(call.get("index", 0)),
+                                                {"id": "", "name": "", "args": ""})
+                        held["id"] = call.get("id") or held["id"]
+                        fn = call.get("function") or {}
+                        held["name"] = fn.get("name") or held["name"]
+                        held["args"] += fn.get("arguments") or ""
+        blocks = [Block("text", text=text)] if text else []
+        for index in sorted(calls):
+            held = calls[index]
+            try:
+                args = json.loads(held["args"] or "{}")
+            except ValueError:
+                args = {}
+            blocks.append(Block("tool_use", id=held["id"], name=held["name"], input=args))
+        return Answer(blocks, {"input_tokens": usage.get("prompt_tokens", 0),
+                               "output_tokens": usage.get("completion_tokens", 0)}, named)
+
+    def _create(self, *, model: str, max_tokens: int, messages: list, system: Any = None,
+                tools: Optional[list] = None, tool_choice: Optional[dict] = None,
+                **extra: Any) -> Answer:
+        body = self._body(model, max_tokens, messages, system, tools, tool_choice, extra)
         answer = httpx.post(self.url, json=body, headers=self.headers, timeout=self.timeout)
         if answer.status_code >= 400:
             raise ModelError(answer.status_code, answer.text)

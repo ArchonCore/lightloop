@@ -30,6 +30,8 @@ print(result.text)
   the model reads the reason and decides again.
 - Both the Anthropic Messages API and OpenAI chat completions, behind one shape
   (`AnthropicClient`, `OpenAIClient`).
+- `on_text=print_piece` streams the model's text as it is written, for a chat that shows the
+  answer coming (`AnthropicClient` and `OpenAIClient` both stream).
 - Prompt caching on Anthropic: the system prompt, the tools and the conversation's last block
   are cache breakpoints.
 

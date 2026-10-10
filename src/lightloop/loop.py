@@ -128,12 +128,14 @@ def run_loop(client, *, model: str, system: str, messages: list[dict], tools: li
              cache_key: str = "", cache_ttl: str = "5m", reasoning_effort: str = "",
              on_step: Optional[Callable[[dict], None]] = None,
              before_call: Optional[Callable[[], list[dict]]] = None,
-             stop: Optional[Callable[[], bool]] = None) -> LoopResult:
+             stop: Optional[Callable[[], bool]] = None,
+             on_text: Optional[Callable[[str], None]] = None) -> LoopResult:
     """One run. `tool_choice="any"`: tool calls until an ending tool accepts or `max_steps`
     model calls are spent. `"auto"`: until the model answers with no tool call. `on_step` hears
     each tool call and each answer as `{"kind", ...}`; `before_call` may add user messages
     before each model call after the first (a message that arrived during the run); `stop`
-    ends the run before the next model call."""
+    ends the run before the next model call; `on_text` hears the model's text piece by piece
+    as it is written, on a client that streams (`client.py`)."""
     by_name = {t.name: t for t in tools}
     definitions = _definitions(tools, dialect, cache_ttl)
     convo = [dict(m) for m in messages]
@@ -160,7 +162,9 @@ def run_loop(client, *, model: str, system: str, messages: list[dict], tools: li
                       messages=_marked(convo, dialect, cache_ttl), **extra)
         if definitions:
             kwargs.update(tools=definitions, tool_choice={"type": tool_choice})
-        answer = client.messages.create(**kwargs)
+        streams = on_text is not None and hasattr(client.messages, "stream_create")
+        answer = (client.messages.stream_create(on_text=on_text, **kwargs) if streams
+                  else client.messages.create(**kwargs))
         result.usage.append(getattr(answer, "usage", None))
         blocks = [b for b in (_block(x) for x in getattr(answer, "content", []) or [])
                   if b["type"] == "tool_use" or b["text"].strip()]
