@@ -48,6 +48,35 @@ When `LIGHTLOOP_BASE_URL` and `LIGHTLOOP_TOKEN` name an endpoint that resolves m
 Archon node gives its apps one), `connect(level=0)` asks it which model that level is, and
 `connect(caller=...)` names whom the call serves.
 
+## Knowledge, guardrails and learning
+
+```python
+from lightloop import Guardrails, Knowledge, learn
+
+knowledge = Knowledge("knowledge")        # the app's folder, or LIGHTLOOP_KNOWLEDGE_URL
+rails = Guardrails.load()                 # LIGHTLOOP_GUARDRAILS_URL, else guardrails.json
+system = rails.system("You answer customers about their orders.")
+tools = rails.tools([knowledge.tool(), *tools])
+
+result = run_loop(conn.client, model=conn.model, dialect=conn.dialect, system=system,
+                  messages=messages, tools=tools, tool_choice="auto", max_steps=6)
+# when the conversation is over:
+learn(conn, system=system, messages=result.messages, tools=tools, conversation="c-1042")
+```
+
+- `Knowledge` lists and reads the app's knowledge files, from its folder or from
+  `LIGHTLOOP_KNOWLEDGE_URL`; `knowledge.tool()` gives the model one tool for both.
+- `Guardrails` puts its cautions before the system prompt and refuses a tool call one of its
+  hooks matches: `{"tool": "<name or glob>", "field": "<input field>", "matches": "<regex>"}`.
+- `learn` asks the model once, at a conversation's end, what the conversation taught and hands
+  it to `LIGHTLOOP_LEARN_URL`. With no such address it does nothing.
+
+| variable | meaning |
+|---|---|
+| `LIGHTLOOP_KNOWLEDGE_URL` | an endpoint serving the knowledge files |
+| `LIGHTLOOP_GUARDRAILS_URL` | an endpoint serving `{"cautions": [...], "hooks": [...]}` |
+| `LIGHTLOOP_LEARN_URL` | an endpoint taking a conversation's lessons |
+
 ## License
 
 Apache-2.0.
