@@ -34,10 +34,22 @@ def learn(conn: Connection, *, system: str, messages: list[dict], tools: list[To
           conversation: str, caller: str = "", url: str = "", token: str = "",
           max_tokens: int = 1500) -> Optional[dict]:
     """The conversation's dump, handed to the learning endpoint; None when there is no endpoint
-    or nothing to tell."""
+    or nothing to tell, `{"kept": False, "error": ...}` when learning failed. It never raises:
+    the conversation it follows is already answered."""
     url = (url or os.environ.get(LEARN_URL_ENV, "")).strip()
     if not url:
         return None
+    try:
+        return _learn(conn, system=system, messages=messages, tools=tools,
+                      conversation=conversation, caller=caller, url=url, token=token,
+                      max_tokens=max_tokens)
+    except Exception as exc:  # noqa: BLE001 - learning never breaks a conversation
+        return {"kept": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _learn(conn: Connection, *, system: str, messages: list[dict], tools: list[Tool],
+           conversation: str, caller: str, url: str, token: str,
+           max_tokens: int) -> Optional[dict]:
     token = (token or os.environ.get(TOKEN_ENV, "")).strip()
     auth = {"authorization": f"Bearer {token}"}
     asked = httpx.get(url, headers=auth, timeout=30)
